@@ -65,6 +65,18 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
     # list after `max_jumps` discrete jumps
     count_jumps = 0
 
+    # simulation
+    got_ensemble = get(kwargs, :ensemble, false)
+    if got_ensemble
+        t0_start = t0
+        all_simulations = []
+        states2sim_indices = Dict()
+        kwargs_sim = copy(kwargs)
+        if :T in keys(kwargs_sim)
+            pop!(kwargs_sim, :T)
+        end
+    end
+
     while !isempty(waiting_list)
         (Δt0, elem) = pop!(waiting_list)
         tprev = tstart(Δt0)
@@ -74,12 +86,42 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
         q = location(elem)
         X0 = state(elem)
         S = mode(H, q)
+        ivp_current = IVP(S, X0)
         time_span = TimeInterval(t0, T-tprev) # TODO generalization for t0 ≠ 0.. T-tprev+t0 ?
-        F = post(cpost, IVP(S, X0), time_span; Δt0=Δt0, kwargs...)
+        F = post(cpost, ivp_current, time_span; Δt0=Δt0, kwargs...)
 
         # assign location q to this flowpipe
         F.ext[:loc_id] = q
         push!(out, F)
+
+        I⁻ = stateset(H, q)
+
+        if got_ensemble
+            @requires DifferentialEquations
+            # compute trajectories using ensemble simulation
+            if tprev == t0_start
+                # initial simulation; samples from initial states
+                simulations = _solve_ensemble(ivp_current, args...;
+                                              tspan=time_span, kwargs_sim...)
+                _cut_simulations!(simulations, I⁻)
+                nsim = length(all_simulations)
+                for sim in simulations
+                    push!(all_simulations, [sim])
+                end
+                sim_indices = nsim+1:length(all_simulations)
+            else
+                # continue previous simulations
+                sim_indices = pop!(states2sim_indices, elem)
+                initial_states = [all_simulations[i][end].u[end] for i in sim_indices]
+                simulations = _solve_ensemble(ivp_current, args...;
+                                              initial_states=initial_states,
+                                              tspan=time_span, kwargs_sim...)
+                _cut_simulations!(simulations, I⁻)
+                for (i, si) in enumerate(sim_indices)
+                    push!(all_simulations[si], simulations[i])
+                end
+            end
+        end
 
         #=
         # NOTE: here we may take the concrete intersection with the source invariant
@@ -90,8 +132,6 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
         compute the concrete intersection.
         =#
         if intersect_source_invariant
-            I⁻ = stateset(H, q)
-
             # assign location q to this flowpipe
             F_in_inv = Flowpipe(undef, STwl, 0)
 
@@ -107,6 +147,7 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
 
         # process jumps for all outgoing transitions with source q
         for t in out_transitions(H, q)
+            # FIXME take jumps with simulations
 
             # instantiate post_d : X -> (R(X ∩ G ∩ I⁻) ⊕ W) ∩ I⁺
             discrete_post = DiscreteTransition(H, t)
@@ -142,16 +183,21 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
                 hit_max_jumps = count_jumps > max_jumps
                 if hit_max_jumps
                     @warn "maximum number of jumps reached; try increasing `max_jumps`"
+                    continue
                 end
 
                 if fixpoint_check
-                    if !hit_max_jumps && !(Xr ⊆ explored_list)
-                        push!(waiting_list, tspan(Xci), Xr)
-                    end
+                    add_to_waiting_list = !(Xr ⊆ explored_list)
                 else
                     # We only push the set Xci if it intersects with time_span
-                    if !hit_max_jumps && !IA.isdisjoint(tspan(Xci), time_span0)
-                        push!(waiting_list, tspan(Xci), Xr)
+                    add_to_waiting_list = !IA.isdisjoint(tspan(Xci), time_span0)
+                end
+
+                if add_to_waiting_list
+                    push!(waiting_list, tspan(Xci), Xr)
+
+                    if got_ensemble
+                        states2sim_indices[Xr] = sim_indices
                     end
                 end
             end
@@ -164,7 +210,13 @@ function solve(ivp::IVP{<:AbstractHybridSystem}, args...;
     else
         HFout = HybridFlowpipe(out)
     end
-    sol = ReachSolution(HFout, cpost)
+    if got_ensemble
+        simulations_processed = _merge_simulations(all_simulations)
+        dict = Dict{Symbol,Any}(:ensemble=>simulations_processed)
+        sol = ReachSolution(HFout, cpost, dict)
+    else
+        sol = ReachSolution(HFout, cpost)
+    end
 end
 
 # =====================================
@@ -458,3 +510,44 @@ end
 Abstract supertype of all discrete post operators.
 """
 abstract type AbstractDiscretePost <: AbstractPost end
+
+# =====================================
+# Simulation
+# =====================================
+
+function _merge_simulations(simulations)
+    # FIXME merge to something useful
+    for sim in simulations
+        for i in 1:length(sim)
+            i == 1 && continue
+
+            # shift time points forward
+            tprev = sim[i-1].t[end]
+            sim[i].t .+= tprev
+        end
+    end
+    return simulations
+end
+
+function _cut_simulations!(simulations, invariant)
+    idx = -1
+    for simulation in simulations
+        for (i, ui) in enumerate(simulation.u)
+            println(ui)
+            if ui ∉ invariant
+                println(i)
+                idx = i
+                break
+            end
+        end
+        if idx == -1
+            return simulation
+        end
+
+        idx_remove = idx:length(simulation.u)
+        deleteat!(simulation.u, idx_remove)
+        deleteat!(simulation.t, idx_remove)
+    end
+
+    return simulations
+end
